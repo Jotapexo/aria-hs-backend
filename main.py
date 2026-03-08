@@ -1,84 +1,89 @@
 """
-ARIA v4 — Backend FastAPI
-==========================
-Stack:
-  - Gemini 2.0 Flash (Google) → cerebro IA — GRATIS
-  - Web Speech API (browser)  → voz TTS sin costo ni configuración
-  - ChromaDB + sentence-transformers → RAG con PDFs reales
+ARIA v4 — Backend FastAPI (liviano, sin ChromaDB)
+==================================================
+Stack minimalista que cabe en Railway gratis:
+  - Gemini 2.0 Flash → cerebro IA
+  - RAG liviano: lee PDFs con pypdf, busca por palabras clave
+  - Sin ChromaDB ni sentence-transformers (muy pesados)
+  - Imagen final ~300 MB
 """
 
 import os
+import re
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
 import google.generativeai as genai
-
-# RAG
-import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from pypdf import PdfReader
 
 # ── Config ────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL   = "gemini-2.0-flash"
 DOCS_DIR       = Path("docs")
-CHUNK_SIZE     = 800
-CHUNK_OVERLAP  = 100
+CHUNK_SIZE     = 600
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-app = FastAPI(title="ARIA H&S API", version="4.4.0")
+app = FastAPI(title="ARIA H&S API", version="4.5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ── ChromaDB ──────────────────────────────────────────────────────────
-chroma_client = chromadb.Client()
-embed_fn      = SentenceTransformerEmbeddingFunction(
-    model_name="paraphrase-multilingual-MiniLM-L12-v2"
-)
-collection  = chroma_client.get_or_create_collection(name="aria_hs", embedding_function=embed_fn)
-docs_indexed = []
+# ── Cargar PDFs en memoria al arrancar ────────────────────────────────
+knowledge_base = []   # lista de {"source": str, "text": str}
+docs_indexed   = []
 
-def chunk_text(text: str) -> list:
-    chunks, start = [], 0
-    while start < len(text):
-        end = min(start + CHUNK_SIZE, len(text))
-        chunks.append(text[start:end])
-        start += CHUNK_SIZE - CHUNK_OVERLAP
-    return [c for c in chunks if len(c.strip()) > 50]
-
-def index_pdfs():
-    global docs_indexed
+def load_pdfs():
     if not DOCS_DIR.exists():
-        print(f"[ARIA] Carpeta '{DOCS_DIR}' no encontrada.")
+        print(f"[ARIA] Sin carpeta docs/ — solo conocimiento base.")
         return
     pdfs = list(DOCS_DIR.glob("*.pdf"))
     if not pdfs:
         print("[ARIA] No hay PDFs en docs/")
         return
-    all_chunks, all_ids, all_metas = [], [], []
-    chunk_id = 0
     for pdf_path in pdfs:
         try:
             reader = PdfReader(str(pdf_path))
             text   = "\n".join(p.extract_text() or "" for p in reader.pages)
-            chunks = chunk_text(text)
-            for i, chunk in enumerate(chunks):
-                all_chunks.append(chunk)
-                all_ids.append(f"{pdf_path.stem}_{chunk_id}")
-                all_metas.append({"source": pdf_path.name, "chunk": i})
-                chunk_id += 1
-            docs_indexed.append({"name": pdf_path.name, "pages": len(reader.pages), "chunks": len(chunks)})
-            print(f"[ARIA] ✓ {pdf_path.name} — {len(reader.pages)} págs, {len(chunks)} fragmentos")
+            # Dividir en fragmentos de CHUNK_SIZE caracteres
+            for i in range(0, len(text), CHUNK_SIZE):
+                chunk = text[i:i + CHUNK_SIZE].strip()
+                if len(chunk) > 80:
+                    knowledge_base.append({"source": pdf_path.name, "text": chunk})
+            docs_indexed.append({"name": pdf_path.name, "pages": len(reader.pages)})
+            print(f"[ARIA] ✓ {pdf_path.name} — {len(reader.pages)} páginas")
         except Exception as e:
-            print(f"[ARIA] ✗ Error en {pdf_path.name}: {e}")
-    if all_chunks:
-        collection.upsert(documents=all_chunks, ids=all_ids, metadatas=all_metas)
-        print(f"[ARIA] ✓ {len(all_chunks)} fragmentos indexados.")
+            print(f"[ARIA] ✗ {pdf_path.name}: {e}")
+    print(f"[ARIA] ✓ {len(knowledge_base)} fragmentos listos.")
 
-index_pdfs()
+load_pdfs()
+
+# ── RAG liviano por palabras clave ────────────────────────────────────
+def get_rag_context(question: str, top_k: int = 4) -> str:
+    if not knowledge_base:
+        return ""
+    # Tokenizar pregunta
+    words = set(re.findall(r'\w+', question.lower()))
+    stop  = {"el","la","los","las","de","del","en","que","es","un","una","y","o","a","con","por","para","se","su","al"}
+    words -= stop
+
+    # Puntuar cada fragmento
+    scored = []
+    for item in knowledge_base:
+        text_lower = item["text"].lower()
+        score = sum(1 for w in words if w in text_lower)
+        if score > 0:
+            scored.append((score, item))
+
+    # Ordenar por relevancia y tomar los top_k
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[:top_k]
+
+    if not top:
+        return ""
+
+    fragments = [f"[Fuente: {item['source']}]\n{item['text']}" for _, item in top]
+    return "\n\n---\n\n".join(fragments)
 
 # ── System Prompt ─────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Eres ARIA (Asistente de Riesgos Industriales Autónomo), asistente virtual de
@@ -100,7 +105,7 @@ CONTEXTO HOLCIM ECUADOR:
 
 REGLAS:
 1. Español siempre. Máximo 3-4 oraciones por turno.
-2. Si hay CONTEXTO DE DOCUMENTOS, úsalo como prioridad y cita la fuente.
+2. Si hay CONTEXTO DE DOCUMENTOS úsalo como prioridad y cita la fuente.
 3. Cada 3-4 respuestas haz UNA pregunta de verificación.
 4. Ante peligro inmediato: tono URGENTE."""
 
@@ -109,25 +114,8 @@ TOUR_STEPS = [
     "Continuamos en el ÁREA DE MOLIENDA. El ruido supera los 95 decibeles, sobre el límite de 85. La protección auditiva NRR 25 es obligatoria. Retirarla aunque sea un instante puede causar daño auditivo permanente. ¿Usas correctamente tus protectores auditivos?",
     "Llegamos al HORNO ROTATORIO, la zona de mayor riesgo: hasta 1450 grados Celsius. Todo mantenimiento requiere procedimiento LOTO completo y permiso de trabajo en caliente. ¿Conoces los 7 pasos del bloqueo y etiquetado?",
     "Visitamos los SILOS DE CEMENTO, espacios confinados con riesgo de asfixia. Nadie ingresa sin permiso firmado, oxígeno entre 19.5 y 23.5%, detector de gases y vigía externo. ¿Sabes usar el detector de gases?",
-    "Finalizamos en ENSACADO Y DESPACHO. Tráfico intenso de montacargas: respeta los pasillos amarillos. En emergencia: activa alarma, evacúa por rutas verdes, repórtate en tu punto de encuentro. ¿Conoces tu punto de encuentro?"
+    "Finalizamos en ENSACADO Y DESPACHO. Tráfico intenso de montacargas: respeta los pasillos amarillos. En emergencia activa alarma, evacúa por rutas verdes y repórtate en tu punto de encuentro. ¿Conoces tu punto de encuentro?"
 ]
-
-# ── RAG ───────────────────────────────────────────────────────────────
-def get_rag_context(question: str) -> str:
-    if collection.count() == 0:
-        return ""
-    try:
-        n = min(4, collection.count())
-        results = collection.query(query_texts=[question], n_results=n)
-        if not results["documents"] or not results["documents"][0]:
-            return ""
-        fragments = []
-        for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
-            fragments.append(f"[Fuente: {meta.get('source','?')}]\n{doc}")
-        return "\n\n---\n\n".join(fragments)
-    except Exception as e:
-        print(f"[ARIA] RAG error: {e}")
-        return ""
 
 # ── Modelos ───────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
@@ -138,18 +126,18 @@ class ChatRequest(BaseModel):
 # ── Endpoints ─────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"status": "ARIA v4.4 online", "model": GEMINI_MODEL}
+    return {"status": "ARIA v4.5 online", "model": GEMINI_MODEL}
 
 @app.get("/api/status")
 async def status():
     return {
         "online":       True,
         "gemini":       bool(GEMINI_API_KEY),
-        "google_tts":   False,   # TTS lo maneja el browser con Web Speech API
+        "google_tts":   False,
         "model":        GEMINI_MODEL,
         "voice":        "Web Speech API (browser)",
         "docs_indexed": docs_indexed,
-        "total_chunks": collection.count(),
+        "total_chunks": len(knowledge_base),
         "tour_steps":   len(TOUR_STEPS),
     }
 
@@ -167,7 +155,7 @@ async def chat(req: ChatRequest):
     context = get_rag_context(req.question) if req.use_rag else ""
     system  = SYSTEM_PROMPT
     if context:
-        system += f"\n\nCONTEXTO DE DOCUMENTOS OFICIALES:\n{context}"
+        system += f"\n\nCONTEXTO DE DOCUMENTOS OFICIALES (prioridad máxima):\n{context}"
 
     history_gemini = []
     for h in req.history[-12:]:
